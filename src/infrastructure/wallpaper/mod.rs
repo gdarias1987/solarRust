@@ -39,7 +39,7 @@ pub fn active() -> Option<std::path::PathBuf> {
 
 /// `mode` is a request about how the picture meets the screen, not about a specific desktop;
 /// the names below are the closest thing to a common vocabulary the desktops share.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Placement {
     /// The whole picture, letterboxed when the aspect ratio differs.
@@ -50,7 +50,7 @@ pub(crate) enum Placement {
     Center,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn placement(mode: crate::domain::Mode) -> Placement {
     use crate::domain::Mode;
     match mode {
