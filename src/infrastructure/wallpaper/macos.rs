@@ -5,11 +5,11 @@
 //! The native call reports success even when recent builds quietly keep the old picture, so
 //! the desktop is read back afterwards and System Events is the fallback.
 
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use dispatch2::DispatchQueue;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -27,29 +27,6 @@ use crate::{Error, Result, domain::Mode};
 /// going. A real round trip takes microseconds.
 const MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
 
-struct Job {
-    run: Option<Box<dyn FnOnce() + Send>>,
-}
-
-extern "C" fn trampoline(context: *mut c_void) {
-    // SAFETY: `context` is the `Box::into_raw` pointer handed to `dispatch_async_f` below,
-    // and libdispatch calls this trampoline exactly once with it.
-    let mut job = unsafe { Box::from_raw(context.cast::<Job>()) };
-    let run = job.run.take();
-    // A panic must not cross an `extern "C"` boundary; dropping the sender instead makes
-    // the waiting side report the failure.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        if let Some(run) = run {
-            run();
-        }
-    }));
-}
-
-unsafe extern "C" {
-    fn dispatch_get_main_queue() -> *mut c_void;
-    fn dispatch_async_f(queue: *mut c_void, context: *mut c_void, work: extern "C" fn(*mut c_void));
-}
-
 /// Runs `work` on the main thread and brings its value back.
 fn on_main<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T> {
     // Dispatching to the queue we are standing on would deadlock, and every AppKit call
@@ -58,15 +35,9 @@ fn on_main<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Resu
         return Ok(work());
     }
     let (send, receive) = mpsc::channel();
-    let job = Box::new(Job {
-        run: Some(Box::new(move || {
-            let _ = send.send(work());
-        })),
+    DispatchQueue::main().exec_async(move || {
+        let _ = send.send(work());
     });
-    let context = Box::into_raw(job).cast::<c_void>();
-    // SAFETY: the main queue is a process-wide singleton; the job owns the context until the
-    // trampoline takes it apart.
-    unsafe { dispatch_async_f(dispatch_get_main_queue(), context, trampoline) };
     receive
         .recv_timeout(MAIN_QUEUE_TIMEOUT)
         .map_err(|_| Error::Invalid("The main thread did not answer the wallpaper request".into()))

@@ -31,6 +31,7 @@ embed-resource = "3.0.12"
 # is its own feature, and the defaults pull in frameworks this app never touches, so the list
 # is exactly what the wallpaper backend reads.
 [target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = { version = "0.3.1", default-features = false, features = ["std"] }
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSURL", "NSString", "NSArray", "NSDictionary", "NSValue", "NSEnumerator"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSScreen", "NSCell"] }

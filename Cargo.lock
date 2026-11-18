@@ -3357,6 +3357,7 @@ dependencies = [
 name = "solar-rust"
 version = "0.1.0"
 dependencies = [
+ "dispatch2",
  "embed-resource",
  "httpdate",
  "image",
