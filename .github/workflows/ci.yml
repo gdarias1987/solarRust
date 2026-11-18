@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The wallpaper adapter is written once per system, and only the one matching the host is
+  # compiled — so every target has to compile and test, not just the maintainer's.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+
+  # Rendering needs a window session, which the Windows runner is the one that has provided
+  # reliably here.
+  smoke:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Headless smoke render
+        shell: pwsh
+        run: |
+          $env:SOLAR_OFFLINE = "1"
+          $env:SOLAR_DATA_DIR = Join-Path $env:RUNNER_TEMP "solarrust-data"
+          cargo run --locked -- --scene demo --snap "$env:RUNNER_TEMP/demo.png" --size 1180x820
+          if (-not (Test-Path "$env:RUNNER_TEMP/demo.png")) { throw "no snapshot was rendered" }
