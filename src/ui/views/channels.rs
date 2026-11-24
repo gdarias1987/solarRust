@@ -502,6 +502,7 @@ mod tests {
             commands: Some(commands),
             ..State::default()
         };
+        state.archive.preferences.language = solar_rust::domain::Language::Es;
         state.archive.records.push(solar_rust::domain::Record {
             id: "capture-1".into(),
             channel: "0304".into(),
