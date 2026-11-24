@@ -12,7 +12,6 @@ use crate::ui::{
 use super::{Paint, format_bytes, page_header, picture, tr, utc_date, utc_hhmm};
 
 pub fn view(state: &State, p: Paint) -> El {
-    let t = p.t;
     let mut records: Vec<&Record> = state.archive.records.iter().collect();
     records.sort_by_key(|r| std::cmp::Reverse(r.downloaded_at));
 
@@ -43,23 +42,7 @@ pub fn view(state: &State, p: Paint) -> El {
     if let Some(latest) = records.first() {
         body = body
             .child(latest_card(state, p, latest))
-            .child(
-                row()
-                    .w_full()
-                    .center_y()
-                    .justify_between()
-                    .pt(6.0)
-                    .child(components::section_label(tr(
-                        state,
-                        "All captures",
-                        "Todas las capturas",
-                    )))
-                    .child(components::label(
-                        format!("{}", records.len()),
-                        theme::MONO_SM,
-                        t.text_4,
-                    )),
-            )
+            .child(history_controls(state, p, records.len()))
             .child(grid(state, p, &records));
     } else {
         body = body.child(empty(state, p));
@@ -72,9 +55,135 @@ pub fn view(state: &State, p: Paint) -> El {
         .min_h(0.0)
         .gap(16.0)
         .child(header)
+        .child(clear_history_feedback(state, p))
         .child(body.h_full().min_h(0.0).scroll(ScrollSpec {
             stick_bottom: false,
         }))
+}
+
+fn history_controls(state: &State, p: Paint, count: usize) -> El {
+    let t = p.t;
+    let controls = if state.clear_history_confirming {
+        row()
+            .gap(8.0)
+            .center_y()
+            .child(components::label(
+                tr(
+                    state,
+                    "Remove all stored capture history?",
+                    "¿Eliminar todo el historial de capturas?",
+                ),
+                theme::BODY_SM,
+                t.danger,
+            ))
+            .child(ghost_button(
+                tr(state, "Cancel", "Cancelar"),
+                &icons::CLOSE,
+                |s: &mut State| s.cancel_clear_history(),
+            ))
+            .child(accent_button(
+                tr(state, "Confirm clear", "Confirmar borrado"),
+                &icons::CLOSE,
+                |s: &mut State| s.confirm_clear_history(),
+            ))
+    } else if state.clear_history_pending {
+        row().center_y().child(components::label(
+            if state.clear_history_queued {
+                tr(
+                    state,
+                    "Waiting for the current operation…",
+                    "Esperando a que termine la operación actual…",
+                )
+            } else {
+                tr(state, "Clearing history…", "Borrando historial…")
+            },
+            theme::BODY_SM,
+            t.text_3,
+        ))
+    } else {
+        row()
+            .gap(12.0)
+            .center_y()
+            .child(components::label(
+                format!("{count}"),
+                theme::MONO_SM,
+                t.text_4,
+            ))
+            .child(ghost_button(
+                tr(state, "Clear history", "Borrar historial"),
+                &icons::CLOSE,
+                |s: &mut State| s.request_clear_history(),
+            ))
+    };
+    row()
+        .w_full()
+        .center_y()
+        .justify_between()
+        .pt(6.0)
+        .child(components::section_label(tr(
+            state,
+            "All captures",
+            "Todas las capturas",
+        )))
+        .child(controls)
+}
+
+fn clear_history_feedback(state: &State, p: Paint) -> El {
+    let Some(feedback) = &state.clear_history_feedback else {
+        return el().h(0.0).w_full().a11y_hidden();
+    };
+    let (message, color) = match feedback {
+        crate::ui::ClearHistoryFeedback::Cleared {
+            preserved_files: _,
+            active_unknown: true,
+        } => (
+            tr(
+                state,
+                "History cleared; capture files were retained because the active wallpaper could not be identified.",
+                "Se borró el historial; se conservaron los archivos porque no se pudo identificar el fondo activo.",
+            )
+            .to_owned(),
+            p.t.amber,
+        ),
+        crate::ui::ClearHistoryFeedback::Cleared {
+            preserved_files: count,
+            active_unknown: false,
+        } if *count > 0 => (
+            if state.archive.preferences.language == solar_rust::domain::Language::Es {
+                format!(
+                    "Se borró el historial; se conservaron {count} archivo{} para el fondo o el recorte.",
+                    if *count == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
+                    "History cleared; {count} file{} were kept for wallpaper or crop settings.",
+                    if *count == 1 { "" } else { "s" }
+                )
+            },
+            p.t.amber,
+        ),
+        crate::ui::ClearHistoryFeedback::Cleared { .. } => (
+            tr(state, "Capture history cleared.", "Se borró el historial de capturas.")
+                .to_owned(),
+            p.t.teal,
+        ),
+        crate::ui::ClearHistoryFeedback::Failed(error) => (
+            format!(
+                "{}: {error}",
+                tr(state, "Could not clear history", "No se pudo borrar el historial")
+            ),
+            p.t.danger,
+        ),
+    };
+    row()
+        .w_full()
+        .min_h(34.0)
+        .px(10.0)
+        .center_y()
+        .radius(8.0)
+        .fill(color.alpha(0.09))
+        .border(1.0, color.alpha(0.22))
+        .child(components::label(message, theme::BODY_SM, color).wrap())
 }
 
 fn latest_card(state: &State, p: Paint, record: &Record) -> El {
@@ -89,7 +198,8 @@ fn latest_card(state: &State, p: Paint, record: &Record) -> El {
     row()
         .key("latest-card")
         .w_full()
-        .h(272.0)
+        // Keep the metadata and bottom action row inside the card at the standard window size.
+        .h(304.0)
         .padding(10.0)
         .gap(16.0)
         .radius(18.0)

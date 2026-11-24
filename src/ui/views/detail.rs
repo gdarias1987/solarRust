@@ -103,11 +103,19 @@ fn details(
         .padding(18.0)
         .gap(9.0)
         .radius(18.0)
-        .fill(t.panel)
+        // Leave enough translucency for the glass slot to sample what is behind this panel.
+        // SolarFx paints an opaque static fallback at the slot if backdrop copies are unavailable.
+        .fill(t.panel.alpha(0.72))
         .border(1.0, t.hairline)
         .scroll(rune::ScrollSpec {
             stick_bottom: false,
         })
+        .child(
+            el().key("detail-glass-slot")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .effect(super::super::effects::GLASS)
+                .effect_backdrop(true),
+        )
         .child(components::micro(tr(state, "Capture", "Captura"), t.text_3))
         .child(components::label(
             channel

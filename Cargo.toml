@@ -1,6 +1,6 @@
 [package]
 name = "solar-rust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
@@ -8,6 +8,7 @@ license = "Apache-2.0"
 [dependencies]
 rune = { git = "https://github.com/anomalyco/rune", rev = "38e75af6c22915c01d5e219f53d5f0af6edf9a11" }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "38e75af6c22915c01d5e219f53d5f0af6edf9a11" }
+rune-fx = { git = "https://github.com/anomalyco/rune", rev = "38e75af6c22915c01d5e219f53d5f0af6edf9a11" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -3,6 +3,7 @@
 
 mod art;
 mod components;
+pub(crate) mod effects;
 mod icons;
 mod reference_previews;
 mod theme;
@@ -30,7 +31,7 @@ pub fn app_icon() -> Vec<u8> {
     art::app_icon_png(256)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Channels,
     Gallery,
@@ -50,6 +51,14 @@ pub struct State {
     pub outcome: Option<Outcome>,
     pub error: Option<String>,
     pub busy: bool,
+    pub clear_history_confirming: bool,
+    pub clear_history_pending: bool,
+    pub clear_history_queued: bool,
+    pub clear_history_feedback: Option<ClearHistoryFeedback>,
+    /// Request-specific feedback for wallpaper application (not generic sync activity).
+    pub apply_feedback: Option<ApplyFeedback>,
+    apply_request: Option<u64>,
+    next_apply_request: u64,
     /// Set by the `demo` scene: the worker never starts and fixtures are never persisted.
     pub demo_mode: bool,
     /// Instrument grid filter: 0 all, 1 AIA, 2 HMI, 3 composite.
@@ -59,10 +68,27 @@ pub struct State {
     /// A wallpaper layout write sent to the worker and awaiting its request-specific result.
     appearance_pending: Option<(u64, Mode)>,
     next_appearance_request: u64,
+    /// Optimistic channel selection awaiting a worker snapshot that confirms it.
+    pending_channel: Option<(u64, String)>,
     /// The pointer's travel at the last crop drag sample, in window points.
     pub crop_drag: Option<(f32, f32)>,
     commands: Option<Sender<Command>>,
     events: Option<Receiver<Event>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyFeedback {
+    Applying,
+    Applied,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClearHistoryFeedback {
+    Cleared {
+        preserved_files: usize,
+        active_unknown: bool,
+    },
+    Failed(String),
 }
 
 impl Default for State {
@@ -77,11 +103,19 @@ impl Default for State {
             outcome: None,
             error: None,
             busy: false,
+            clear_history_confirming: false,
+            clear_history_pending: false,
+            clear_history_queued: false,
+            clear_history_feedback: None,
+            apply_feedback: None,
+            apply_request: None,
+            next_apply_request: 0,
             demo_mode: false,
             filter: 0,
             appearance_draft: None,
             appearance_pending: None,
             next_appearance_request: 0,
+            pending_channel: None,
             crop_drag: None,
             commands: None,
             events: None,
@@ -177,18 +211,77 @@ impl State {
         self.selected_image
             .as_ref()
             .and_then(|id| self.archive.records.iter().find(|r| &r.id == id))
-            .or_else(|| self.archive.latest(&self.archive.preferences.channel))
+            .or_else(|| self.archive.latest(self.selected_channel()))
+    }
+
+    pub fn selected_channel(&self) -> &str {
+        self.pending_channel
+            .as_ref()
+            .map(|(_, channel)| channel.as_str())
+            .unwrap_or(&self.archive.preferences.channel)
     }
 
     pub fn go(&mut self, page: Page) {
         self.page = page;
     }
 
+    pub fn request_clear_history(&mut self) {
+        if self.clear_history_pending || self.archive.records.is_empty() {
+            return;
+        }
+        self.clear_history_feedback = None;
+        self.clear_history_confirming = true;
+    }
+
+    pub fn cancel_clear_history(&mut self) {
+        if !self.clear_history_pending {
+            self.clear_history_confirming = false;
+        }
+    }
+
+    pub fn confirm_clear_history(&mut self) {
+        if !self.clear_history_confirming || self.clear_history_pending {
+            return;
+        }
+        if self.demo_mode {
+            let preserved_files = self.archive.preferences.crop.is_some() as usize;
+            self.archive.records.clear();
+            self.previews.clear();
+            self.selected_image = None;
+            self.clear_history_confirming = false;
+            self.clear_history_queued = false;
+            self.clear_history_feedback = Some(ClearHistoryFeedback::Cleared {
+                preserved_files,
+                active_unknown: false,
+            });
+            return;
+        }
+        let queued = self.busy;
+        if self.send(Command::ClearHistory) {
+            self.clear_history_pending = true;
+            self.clear_history_queued = queued;
+            self.clear_history_confirming = false;
+        }
+    }
+
     pub fn select_channel(&mut self, id: String) {
         self.selected_image = None;
         self.page = Page::Channels;
-        self.archive.preferences.channel = id.clone();
-        self.preference(Preference::Channel(id));
+        if self.demo_mode {
+            self.archive.preferences.channel = id;
+            self.pending_channel = None;
+        } else {
+            self.next_appearance_request = self.next_appearance_request.wrapping_add(1);
+            let request_id = self.next_appearance_request;
+            if self.send(Command::TrackedPreference {
+                request_id,
+                preference: Preference::Channel(id.clone()),
+            }) {
+                self.pending_channel = Some((request_id, id));
+            } else {
+                self.pending_channel = None;
+            }
+        }
     }
 
     pub fn select_image(&mut self, id: String) {
@@ -204,12 +297,38 @@ impl State {
             self.outcome = Some(outcome);
             return;
         }
-        self.send(Command::Acquire { conditional, apply });
+        let request_id = apply.then(|| self.reserve_apply_request());
+        if self.send(Command::Acquire {
+            conditional,
+            apply,
+            request_id,
+        }) && let Some(id) = request_id
+        {
+            self.apply_request = Some(id);
+            self.apply_feedback = Some(ApplyFeedback::Applying);
+        }
+    }
+
+    fn reserve_apply_request(&mut self) -> u64 {
+        self.next_apply_request = self.next_apply_request.wrapping_add(1);
+        self.next_apply_request
     }
 
     pub fn apply_selected(&mut self) {
+        if self.apply_request.is_some() {
+            return;
+        }
         let Some(record) = self.image().cloned() else {
-            self.error = Some("There is no capture to apply yet".into());
+            // With no local capture, fetch the selected channel and apply it on download.
+            let request_id = self.reserve_apply_request();
+            if self.send(Command::Acquire {
+                conditional: false,
+                apply: true,
+                request_id: Some(request_id),
+            }) {
+                self.apply_request = Some(request_id);
+                self.apply_feedback = Some(ApplyFeedback::Applying);
+            }
             return;
         };
         if self.demo_mode {
@@ -223,7 +342,14 @@ impl State {
             self.error = Some("Wallpaper adapter is not implemented on this platform".into());
             return;
         }
-        self.send(Command::Apply(record.id));
+        let request_id = self.reserve_apply_request();
+        if self.send(Command::Apply {
+            id: record.id,
+            request_id,
+        }) {
+            self.apply_request = Some(request_id);
+            self.apply_feedback = Some(ApplyFeedback::Applying);
+        }
     }
 
     pub fn edit_crop(&mut self) {
@@ -294,8 +420,16 @@ fn handle_event(state: &mut State, event: Event) {
     match event {
         Event::Busy => state.busy = true,
         Event::Fatal(error) => {
-            state.error = Some(error);
+            state.error = Some(error.clone());
             state.busy = false;
+            state.apply_request = None;
+            state.apply_feedback = None;
+            state.pending_channel = None;
+            if state.clear_history_pending {
+                state.clear_history_pending = false;
+                state.clear_history_queued = false;
+                state.clear_history_feedback = Some(ClearHistoryFeedback::Failed(error.clone()));
+            }
             if let Some((_, pending_mode)) = state.appearance_pending.take()
                 && state.appearance_draft.is_none()
             {
@@ -304,25 +438,74 @@ fn handle_event(state: &mut State, event: Event) {
         }
         Event::Snapshot(snapshot) => {
             state.archive = snapshot.archive;
+            if state
+                .selected_image
+                .as_ref()
+                .is_some_and(|id| !state.archive.records.iter().any(|record| &record.id == id))
+            {
+                state.selected_image = None;
+            }
+            if let Some((_, channel)) = &state.pending_channel
+                && state.archive.preferences.channel == *channel
+            {
+                state.pending_channel = None;
+            }
             state.previews = snapshot.previews;
             state.outcome = snapshot.outcome;
             state.error = snapshot.error;
             state.busy = false;
         }
         Event::PreferenceResult { request_id, error } => {
-            let Some((pending_id, pending_mode)) = state.appearance_pending else {
-                return;
-            };
-            if request_id != pending_id {
-                return;
-            }
-            state.appearance_pending = None;
-            if let Some(error) = error {
-                state.error = Some(error);
-                if state.appearance_draft.is_none() {
-                    state.appearance_draft = Some(pending_mode);
+            if let Some((pending_id, pending_mode)) = state.appearance_pending
+                && request_id == pending_id
+            {
+                state.appearance_pending = None;
+                if let Some(error) = &error {
+                    state.error = Some(error.clone());
+                    if state.appearance_draft.is_none() {
+                        state.appearance_draft = Some(pending_mode);
+                    }
                 }
             }
+            if state
+                .pending_channel
+                .as_ref()
+                .is_some_and(|(pending_id, _)| *pending_id == request_id)
+            {
+                state.pending_channel = None;
+                if let Some(error) = error {
+                    state.error = Some(error);
+                }
+            }
+        }
+        Event::ApplyResult { request_id, error } => {
+            if state.apply_request == Some(request_id) {
+                state.apply_request = None;
+                state.busy = false;
+                if let Some(error) = error {
+                    state.error = Some(error);
+                    state.apply_feedback = None;
+                } else {
+                    state.error = None;
+                    state.apply_feedback = Some(ApplyFeedback::Applied);
+                }
+            }
+        }
+        Event::HistoryClearStarted => {
+            state.busy = true;
+            state.clear_history_queued = false;
+        }
+        Event::HistoryClearResult { result } => {
+            state.clear_history_pending = false;
+            state.clear_history_queued = false;
+            state.clear_history_confirming = false;
+            state.clear_history_feedback = Some(match result {
+                Ok(summary) => ClearHistoryFeedback::Cleared {
+                    preserved_files: summary.preserved_files,
+                    active_unknown: summary.active_unknown,
+                },
+                Err(error) => ClearHistoryFeedback::Failed(error),
+            });
         }
     }
 }
@@ -363,9 +546,12 @@ pub fn demo(state: &mut State) {
     state.events = None;
     state.error = None;
     state.busy = false;
+    state.apply_feedback = None;
+    state.apply_request = None;
     state.filter = 0;
     state.appearance_draft = None;
     state.appearance_pending = None;
+    state.pending_channel = None;
     state.archive.preferences.language = Language::En;
     state.archive.preferences.channel = "0304".into();
     state.archive.preferences.mode = solar_rust::domain::Mode::SolarCrop;
@@ -415,7 +601,12 @@ mod tests {
     use super::*;
 
     fn snapshot(mode: Mode, error: Option<&str>) -> Event {
+        channel_snapshot("0304", mode, error)
+    }
+
+    fn channel_snapshot(channel: &str, mode: Mode, error: Option<&str>) -> Event {
         let mut archive = Archive::default();
+        archive.preferences.channel = channel.into();
         archive.preferences.mode = mode;
         Event::Snapshot(Box::new(worker::Snapshot {
             archive,
@@ -493,6 +684,461 @@ mod tests {
 
         state.apply_appearance();
         assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn stale_channel_snapshot_does_not_reset_pending_appearance_mode() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+
+        state.select_appearance(Mode::Span);
+        state.apply_appearance();
+        let (request_id, _) = appearance_command(&receive);
+        state.select_channel("0193".into());
+        let channel_request = match receive.try_recv().expect("channel preference") {
+            Command::TrackedPreference {
+                request_id,
+                preference: Preference::Channel(channel),
+            } => {
+                assert_eq!(channel, "0193");
+                request_id
+            }
+            _ => panic!("unexpected command"),
+        };
+
+        handle_event(&mut state, snapshot(Mode::Fit, None));
+
+        assert_eq!(state.archive.preferences.channel, "0304");
+        assert_eq!(state.selected_channel(), "0193");
+        assert_eq!(state.archive.preferences.mode, Mode::Fit);
+        assert_eq!(state.appearance_mode(), Mode::Span);
+
+        handle_event(&mut state, channel_snapshot("0193", Mode::Span, None));
+        handle_event(
+            &mut state,
+            Event::PreferenceResult {
+                request_id: channel_request,
+                error: None,
+            },
+        );
+        handle_event(
+            &mut state,
+            Event::PreferenceResult {
+                request_id,
+                error: None,
+            },
+        );
+        assert_eq!(state.archive.preferences.mode, Mode::Span);
+        assert!(state.pending_channel.is_none());
+    }
+
+    #[test]
+    fn rapid_channel_selections_survive_stale_snapshots_until_latest_is_confirmed() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+
+        state.select_channel("0193".into());
+        state.select_channel("0171".into());
+        assert!(
+            matches!(receive.try_recv(), Ok(Command::TrackedPreference { preference: Preference::Channel(id), .. }) if id == "0193")
+        );
+        let latest_request = match receive.try_recv().expect("latest channel preference") {
+            Command::TrackedPreference {
+                request_id,
+                preference: Preference::Channel(id),
+            } => {
+                assert_eq!(id, "0171");
+                request_id
+            }
+            _ => panic!("unexpected command"),
+        };
+
+        handle_event(&mut state, channel_snapshot("0304", Mode::Fit, None));
+        assert_eq!(state.archive.preferences.channel, "0304");
+        assert_eq!(state.selected_channel(), "0171");
+        assert_eq!(
+            state
+                .pending_channel
+                .as_ref()
+                .map(|(_, channel)| channel.as_str()),
+            Some("0171")
+        );
+
+        handle_event(&mut state, channel_snapshot("0193", Mode::Fit, None));
+        assert_eq!(state.archive.preferences.channel, "0193");
+        assert_eq!(state.selected_channel(), "0171");
+        assert_eq!(
+            state
+                .pending_channel
+                .as_ref()
+                .map(|(_, channel)| channel.as_str()),
+            Some("0171")
+        );
+
+        handle_event(&mut state, channel_snapshot("0171", Mode::Fit, None));
+        assert_eq!(state.archive.preferences.channel, "0171");
+        assert!(state.pending_channel.is_none());
+        handle_event(
+            &mut state,
+            Event::PreferenceResult {
+                request_id: latest_request,
+                error: None,
+            },
+        );
+    }
+
+    #[test]
+    fn failed_channel_persistence_snapshot_and_result_roll_back_optimistic_selection() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        state.select_channel("0193".into());
+        let request_id = match receive.try_recv().unwrap() {
+            Command::TrackedPreference { request_id, .. } => request_id,
+            _ => panic!("expected tracked preference"),
+        };
+        assert_eq!(state.selected_channel(), "0193");
+
+        handle_event(
+            &mut state,
+            channel_snapshot("0304", Mode::Fit, Some("disk full")),
+        );
+        assert_eq!(state.archive.preferences.channel, "0304");
+        assert_eq!(state.selected_channel(), "0193");
+        assert!(state.pending_channel.is_some());
+        handle_event(
+            &mut state,
+            Event::PreferenceResult {
+                request_id,
+                error: Some("disk full".into()),
+            },
+        );
+
+        assert!(state.pending_channel.is_none());
+        assert_eq!(state.archive.preferences.channel, "0304");
+        assert_eq!(state.selected_channel(), "0304");
+    }
+
+    #[test]
+    fn failed_mode_write_then_cancel_returns_to_persisted_mode() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        let previous = state.archive.preferences.mode;
+        state.select_appearance(Mode::Span);
+        state.apply_appearance();
+        let (request_id, _) = appearance_command(&receive);
+
+        handle_event(&mut state, snapshot(previous, Some("disk full")));
+        assert_eq!(state.archive.preferences.mode, previous);
+        assert_eq!(state.appearance_mode(), Mode::Span);
+        handle_event(
+            &mut state,
+            Event::PreferenceResult {
+                request_id,
+                error: Some("disk full".into()),
+            },
+        );
+        assert!(state.appearance_has_draft());
+
+        state.cancel_appearance();
+        assert_eq!(state.archive.preferences.mode, previous);
+        assert_eq!(state.appearance_mode(), previous);
+    }
+
+    #[test]
+    fn failed_channel_send_clears_pending_and_restores_previous_selection() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        state.select_channel("0193".into());
+        assert_eq!(state.selected_channel(), "0193");
+        drop(receive);
+
+        state.select_channel("0171".into());
+
+        assert!(state.pending_channel.is_none());
+        assert_eq!(state.archive.preferences.channel, "0304");
+        assert_eq!(state.selected_channel(), "0304");
+        assert_eq!(state.error.as_deref(), Some("Worker is unavailable"));
+    }
+
+    #[test]
+    fn fatal_worker_event_clears_pending_channel() {
+        let (commands, _receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        state.select_channel("0193".into());
+        assert_eq!(state.selected_channel(), "0193");
+
+        handle_event(&mut state, Event::Fatal("storage unavailable".into()));
+
+        assert!(state.pending_channel.is_none());
+        assert_eq!(state.selected_channel(), "0304");
+        assert_eq!(state.error.as_deref(), Some("storage unavailable"));
+    }
+
+    #[test]
+    fn apply_selected_dispatches_local_apply_for_the_latest_capture() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        state.archive.records.push(Record {
+            id: "capture-1".into(),
+            channel: "0304".into(),
+            url: String::new(),
+            remote_modified: None,
+            downloaded_at: 1,
+            bytes: 1,
+            file: "capture.jpg".into(),
+            width: 1,
+            height: 1,
+        });
+
+        state.apply_selected();
+
+        let request_id = match receive.try_recv() {
+            Ok(Command::Apply { id, request_id }) if id == "capture-1" => request_id,
+            _ => panic!("unexpected command"),
+        };
+        assert_eq!(state.apply_feedback, Some(ApplyFeedback::Applying));
+        assert!(state.busy);
+
+        handle_event(
+            &mut state,
+            Event::ApplyResult {
+                request_id,
+                error: None,
+            },
+        );
+        assert_eq!(state.apply_feedback, Some(ApplyFeedback::Applied));
+        assert!(!state.busy);
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn failed_apply_clears_pending_feedback_and_exposes_the_error() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        state.archive.records.push(Record {
+            id: "capture-1".into(),
+            channel: "0304".into(),
+            url: String::new(),
+            remote_modified: None,
+            downloaded_at: 1,
+            bytes: 1,
+            file: "capture.jpg".into(),
+            width: 1,
+            height: 1,
+        });
+        state.apply_selected();
+        let request_id = match receive.try_recv().unwrap() {
+            Command::Apply { request_id, .. } => request_id,
+            _ => unreachable!(),
+        };
+        handle_event(
+            &mut state,
+            Event::ApplyResult {
+                request_id,
+                error: Some("adapter failed".into()),
+            },
+        );
+        assert_eq!(state.apply_feedback, None);
+        assert_eq!(state.error.as_deref(), Some("adapter failed"));
+        assert!(state.apply_request.is_none());
+    }
+
+    #[test]
+    fn clear_history_confirmation_can_be_cancelled_without_sending_a_command() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        state.archive.records.push(Record {
+            id: "capture-1".into(),
+            channel: "0304".into(),
+            url: String::new(),
+            remote_modified: None,
+            downloaded_at: 1,
+            bytes: 1,
+            file: "capture.jpg".into(),
+            width: 1,
+            height: 1,
+        });
+
+        state.request_clear_history();
+        assert!(state.clear_history_confirming);
+        state.cancel_clear_history();
+
+        assert!(!state.clear_history_confirming);
+        assert_eq!(state.archive.records.len(), 1);
+        assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn clear_history_confirmation_sends_worker_command_only_after_confirm() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        state.archive.records.push(Record {
+            id: "capture-1".into(),
+            channel: "0304".into(),
+            url: String::new(),
+            remote_modified: None,
+            downloaded_at: 1,
+            bytes: 1,
+            file: "capture.jpg".into(),
+            width: 1,
+            height: 1,
+        });
+        state.request_clear_history();
+        assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        state.confirm_clear_history();
+
+        assert!(matches!(receive.try_recv(), Ok(Command::ClearHistory)));
+        assert!(state.clear_history_pending);
+        assert!(!state.clear_history_confirming);
+    }
+
+    #[test]
+    fn clear_history_can_be_queued_while_another_worker_operation_is_busy() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            busy: true,
+            ..State::default()
+        };
+        state.archive.records.push(Record {
+            id: "capture-1".into(),
+            channel: "0304".into(),
+            url: String::new(),
+            remote_modified: None,
+            downloaded_at: 1,
+            bytes: 1,
+            file: "capture.jpg".into(),
+            width: 1,
+            height: 1,
+        });
+
+        state.request_clear_history();
+        state.confirm_clear_history();
+
+        assert!(matches!(receive.try_recv(), Ok(Command::ClearHistory)));
+        assert!(state.clear_history_pending);
+        assert!(state.clear_history_queued);
+
+        handle_event(&mut state, Event::HistoryClearStarted);
+        assert!(!state.clear_history_queued);
+    }
+
+    #[test]
+    fn clear_history_result_reports_success_and_failure() {
+        let mut state = State {
+            clear_history_pending: true,
+            ..State::default()
+        };
+        handle_event(
+            &mut state,
+            Event::HistoryClearResult {
+                result: Ok(solar_rust::application::ClearHistorySummary {
+                    removed_records: 2,
+                    preserved_files: 1,
+                    active_unknown: true,
+                }),
+            },
+        );
+        assert!(!state.clear_history_pending);
+        assert_eq!(
+            state.clear_history_feedback,
+            Some(ClearHistoryFeedback::Cleared {
+                preserved_files: 1,
+                active_unknown: true,
+            })
+        );
+
+        state.clear_history_pending = true;
+        handle_event(
+            &mut state,
+            Event::HistoryClearResult {
+                result: Err("disk full".into()),
+            },
+        );
+        assert!(!state.clear_history_pending);
+        assert_eq!(
+            state.clear_history_feedback,
+            Some(ClearHistoryFeedback::Failed("disk full".into()))
+        );
+    }
+
+    #[test]
+    fn fatal_worker_event_clears_pending_apply_feedback() {
+        let (commands, _receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        state.archive.records.push(Record {
+            id: "capture-1".into(),
+            channel: "0304".into(),
+            url: String::new(),
+            remote_modified: None,
+            downloaded_at: 1,
+            bytes: 1,
+            file: "capture.jpg".into(),
+            width: 1,
+            height: 1,
+        });
+        state.apply_selected();
+        assert_eq!(state.apply_feedback, Some(ApplyFeedback::Applying));
+
+        handle_event(&mut state, Event::Fatal("storage unavailable".into()));
+
+        assert_eq!(state.apply_feedback, None);
+        assert!(state.apply_request.is_none());
+        assert_eq!(state.error.as_deref(), Some("storage unavailable"));
+    }
+
+    #[test]
+    fn apply_selected_fetches_and_applies_when_no_local_capture_exists() {
+        let (commands, receive) = mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+
+        state.apply_selected();
+
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(Command::Acquire {
+                conditional: false,
+                apply: true,
+                request_id: Some(_)
+            })
+        ));
     }
 
     #[test]

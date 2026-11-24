@@ -1,6 +1,6 @@
 use rune::{Pixels, Waker};
 use solar_rust::{
-    application::{Outcome, Preference, Service},
+    application::{ClearHistorySummary, Outcome, Preference, Service},
     domain::Archive,
     infrastructure::{
         nasa::Nasa,
@@ -22,8 +22,13 @@ pub enum Command {
     Acquire {
         conditional: bool,
         apply: bool,
+        request_id: Option<u64>,
     },
-    Apply(String),
+    Apply {
+        id: String,
+        request_id: u64,
+    },
+    ClearHistory,
 }
 pub struct Snapshot {
     pub archive: Archive,
@@ -37,6 +42,14 @@ pub enum Event {
         request_id: u64,
         error: Option<String>,
     },
+    ApplyResult {
+        request_id: u64,
+        error: Option<String>,
+    },
+    HistoryClearResult {
+        result: std::result::Result<ClearHistorySummary, String>,
+    },
+    HistoryClearStarted,
     Busy,
     Fatal(String),
 }
@@ -104,7 +117,9 @@ pub fn start(wake: Waker) -> (Sender<Command>, Receiver<Event>) {
             }
         };
         publish(&service, None, None);
-        let mut due = Instant::now();
+        // Let the initial archive snapshot render before background network work starts. An
+        // immediate local wallpaper apply must not sit behind the startup NASA request.
+        let mut due = next_due(Instant::now(), service.archive.preferences.interval_seconds);
         loop {
             let command = receive.recv_timeout(if offline {
                 Duration::from_secs(3600)
@@ -125,6 +140,8 @@ pub fn start(wake: Waker) -> (Sender<Command>, Receiver<Event>) {
                 notify(Event::Busy);
             }
             let mut tracked_result = None;
+            let mut apply_request = None;
+            let mut history_clear_result = None;
             match command {
                 Ok(Command::Preference(p)) => {
                     let interval_changed = matches!(&p, Preference::Interval(_));
@@ -147,12 +164,27 @@ pub fn start(wake: Waker) -> (Sender<Command>, Receiver<Event>) {
                     error = result.clone();
                     tracked_result = Some((request_id, result));
                 }
-                Ok(Command::Apply(id)) => {
+                Ok(Command::Apply { id, request_id }) => {
+                    apply_request = Some(request_id);
                     if let Err(e) = service.apply_local(&id) {
                         error = Some(e.to_string());
                     }
                 }
-                Ok(Command::Acquire { conditional, apply }) => {
+                Ok(Command::ClearHistory) => {
+                    notify(Event::HistoryClearStarted);
+                    history_clear_result = Some(service.clear_history().map_err(|e| e.to_string()));
+                    if let Some(Err(message)) = &history_clear_result {
+                        error = Some(message.clone());
+                    }
+                }
+                Ok(Command::Acquire {
+                    conditional,
+                    apply,
+                    request_id,
+                }) => {
+                    if apply {
+                        apply_request = request_id;
+                    }
                     if offline {
                         error = Some("Network disabled by SOLAR_OFFLINE=1".into());
                     } else {
@@ -186,9 +218,22 @@ pub fn start(wake: Waker) -> (Sender<Command>, Receiver<Event>) {
             if let Some(e) = &error {
                 eprintln!("Operation error: {e}");
             }
-            publish(&service, outcome, error);
+            // Resolve request-specific feedback before decoding/publishing archive previews.
+            // A wallpaper can already be set successfully while preview generation for a new
+            // capture is still expensive; holding the Apply button in "Applying…" until then
+            // makes the operation look stuck even though the OS has completed it.
             if let Some((request_id, error)) = tracked_result {
                 notify(Event::PreferenceResult { request_id, error });
+            }
+            if let Some(request_id) = apply_request {
+                notify(Event::ApplyResult {
+                    request_id,
+                    error: error.clone(),
+                });
+            }
+            publish(&service, outcome, error);
+            if let Some(result) = history_clear_result {
+                notify(Event::HistoryClearResult { result });
             }
         }
     });

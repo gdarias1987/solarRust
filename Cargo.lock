@@ -2972,6 +2972,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rune-fx"
+version = "0.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=38e75af6c22915c01d5e219f53d5f0af6edf9a11#38e75af6c22915c01d5e219f53d5f0af6edf9a11"
+dependencies = [
+ "bytemuck",
+ "rune-motion",
+ "rune-staging",
+ "wgpu",
+]
+
+[[package]]
 name = "rune-highlights"
 version = "0.0.1"
 source = "git+https://github.com/anomalyco/rune?rev=38e75af6c22915c01d5e219f53d5f0af6edf9a11#38e75af6c22915c01d5e219f53d5f0af6edf9a11"
@@ -3355,7 +3366,7 @@ dependencies = [
 
 [[package]]
 name = "solar-rust"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dispatch2",
  "embed-resource",
@@ -3366,6 +3377,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "reqwest",
  "rune",
+ "rune-fx",
  "rune-kit",
  "serde",
  "serde_json",

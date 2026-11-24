@@ -194,9 +194,9 @@ pub fn view(state: &State, cx: &mut Cx<State>) -> El {
         Page::Statistics => statistics::view(state, p),
         Page::About => about::view(state, p),
     }
-    // Each page owns its key, so switching mounts a new subtree: it settles in instead of
-    // snapping, with the faint defocus that reads as depth.
-    .transition(rune::Transition::scale(0.994).combined(rune::Transition::offset(0.0, 6.0)));
+    // Keep navigation immediate and legible: a short, fade-free nudge avoids a black gap
+    // between fully transparent page subtrees while preserving a little directional motion.
+    .transition(rune::Transition::offset(0.0, 8.0));
     let base = el()
         .key("root")
         .w_full()

@@ -75,6 +75,7 @@ fn main() {
         )
     })
     .titlebar(rune::Titlebar::new(ui::TITLEBAR_HEIGHT))
+    .compositor(ui::effects::SolarFx::default())
     .run();
 }
 

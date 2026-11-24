@@ -16,6 +16,8 @@ pub fn titlebar(state: &State, p: Paint, insets: ChromeInsets) -> El {
     let t = p.t;
     let (label, ink) = if state.demo_mode {
         (super::tr(state, "Fixture", "Demo"), t.amber)
+    } else if state.apply_feedback == Some(crate::ui::ApplyFeedback::Applying) {
+        (super::tr(state, "Applying", "Aplicando"), t.teal)
     } else if state.busy {
         (super::tr(state, "Syncing", "Sincronizando"), t.amber)
     } else if state.error.is_some() {
@@ -34,7 +36,11 @@ pub fn titlebar(state: &State, p: Paint, insets: ChromeInsets) -> El {
         .center_y()
         .child(components::pulse_dot(
             ink,
-            if state.busy { 1.1 } else { 3.4 },
+            if state.busy || state.apply_feedback == Some(crate::ui::ApplyFeedback::Applying) {
+                1.1
+            } else {
+                3.4
+            },
             live,
         ))
         .child(components::label(label, theme::MONO_SM, ink))

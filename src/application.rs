@@ -25,6 +25,13 @@ pub struct Outcome {
     pub persistence: Stage,
     pub apply: Stage,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClearHistorySummary {
+    pub removed_records: usize,
+    pub preserved_files: usize,
+    pub active_unknown: bool,
+}
 impl Outcome {
     pub fn new(channel: &str) -> Self {
         Self {
@@ -150,6 +157,71 @@ impl<S: ImageSource> Service<S> {
         }
         Ok(())
     }
+
+    /// Remove all history entries and their capture files when the active desktop image is
+    /// known. Keep files still needed by the current wallpaper or saved crop settings.
+    /// Unknown wallpaper state is treated conservatively: clear the manifest, but leave every
+    /// capture file in place rather than risk deleting a file currently shown by the OS.
+    pub fn clear_history(&mut self) -> Result<ClearHistorySummary> {
+        self.clear_history_with_active(wallpaper::active())
+    }
+
+    fn clear_history_with_active(
+        &mut self,
+        active: Option<std::path::PathBuf>,
+    ) -> Result<ClearHistorySummary> {
+        use std::collections::HashSet;
+
+        let active_name = active
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .and_then(|name| name.to_str())
+            .map(str::to_owned);
+        let active_unknown = active_name.is_none();
+        let mut protected = HashSet::new();
+        if let Some(active_name) = &active_name {
+            protected.insert(active_name.clone());
+        }
+        if let Some(crop) = &self.archive.preferences.crop {
+            protected.insert(crop.source.clone());
+        }
+
+        let old = self.archive.clone();
+        let mut next = old.clone();
+        let removed_records = next.records.len();
+        let files: HashSet<_> = old
+            .records
+            .iter()
+            .map(|record| record.file.clone())
+            .collect();
+        next.records.clear();
+        self.store.save(&next)?;
+
+        // Once the manifest is committed, update in-memory state even if cleanup later fails.
+        // In that case return an error so the UI cannot report an unqualified success.
+        self.archive = next;
+        let mut preserved_files = 0;
+        if active_unknown {
+            preserved_files = files.len();
+        } else {
+            for file in files {
+                if protected.contains(&file) {
+                    preserved_files += 1;
+                    continue;
+                }
+                match std::fs::remove_file(self.store.path(&file)?) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(ClearHistorySummary {
+            removed_records,
+            preserved_files,
+            active_unknown,
+        })
+    }
     pub fn acquire(&mut self, channel: &str, conditional: bool, apply: bool) -> Outcome {
         let mut out = Outcome::new(channel);
         let catalog = match catalog::channel(channel) {
@@ -185,6 +257,16 @@ impl<S: ImageSource> Service<S> {
             Fetch::Unchanged { modified } => {
                 out.modified = modified;
                 out.check = Stage::Unchanged;
+                // A fetch-and-apply request can receive HTTP 304. Still apply the latest
+                // archived image; otherwise the UI reports a completed operation without
+                // changing the wallpaper.
+                if apply {
+                    let latest = self.archive.latest(channel).cloned();
+                    out.apply = match latest {
+                        Some(record) => stage(self.apply_record(&record)),
+                        None => Stage::Failed("No local capture is available to apply".into()),
+                    };
+                }
             }
             Fetch::Downloaded { modified, bytes } => {
                 out.modified = modified.clone();
@@ -383,5 +465,86 @@ mod tests {
         assert!(dir.path().join("active.jpg").exists());
         assert!(!dir.path().join("old.jpg").exists());
         assert_eq!(service.store.load().unwrap().records.len(), 2);
+    }
+
+    fn add_capture(service: &mut Service<Offline>, root: &std::path::Path, name: &str) {
+        std::fs::write(root.join(name), [1u8]).unwrap();
+        service.archive.records.push(Record {
+            id: name.into(),
+            channel: "0304".into(),
+            url: String::new(),
+            remote_modified: None,
+            downloaded_at: 1,
+            bytes: 1,
+            file: name.into(),
+            width: 1,
+            height: 1,
+        });
+    }
+
+    #[test]
+    fn clear_history_removes_records_and_files_but_preserves_active_and_crop_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service =
+            Service::open(Store::open(dir.path().to_path_buf()).unwrap(), Offline).unwrap();
+        add_capture(&mut service, dir.path(), "active.jpg");
+        add_capture(&mut service, dir.path(), "crop-source.jpg");
+        add_capture(&mut service, dir.path(), "old.jpg");
+        service.archive.preferences.crop =
+            Some(Crop::centered("crop-source.jpg".into(), 1, 1, 1.0).unwrap());
+        service.store.save(&service.archive).unwrap();
+
+        let summary = service
+            .clear_history_with_active(Some(dir.path().join("active.jpg")))
+            .unwrap();
+
+        assert_eq!(summary.removed_records, 3);
+        assert_eq!(summary.preserved_files, 2);
+        assert!(!summary.active_unknown);
+        assert!(service.archive.records.is_empty());
+        assert!(dir.path().join("active.jpg").is_file());
+        assert!(dir.path().join("crop-source.jpg").is_file());
+        assert!(!dir.path().join("old.jpg").exists());
+        assert!(service.archive.preferences.crop.is_some());
+        assert!(service.store.load().unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn clear_history_with_unknown_active_clears_manifest_but_keeps_all_capture_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service =
+            Service::open(Store::open(dir.path().to_path_buf()).unwrap(), Offline).unwrap();
+        add_capture(&mut service, dir.path(), "one.jpg");
+        add_capture(&mut service, dir.path(), "two.jpg");
+        service.store.save(&service.archive).unwrap();
+
+        let summary = service.clear_history_with_active(None).unwrap();
+
+        assert!(summary.active_unknown);
+        assert_eq!(summary.preserved_files, 2);
+        assert!(service.archive.records.is_empty());
+        assert!(dir.path().join("one.jpg").is_file());
+        assert!(dir.path().join("two.jpg").is_file());
+        assert!(service.store.load().unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn clear_history_save_failure_leaves_manifest_and_capture_files_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut service =
+            Service::open(Store::open(dir.path().to_path_buf()).unwrap(), Offline).unwrap();
+        add_capture(&mut service, dir.path(), "one.jpg");
+        service.store.save(&service.archive).unwrap();
+        std::fs::remove_file(dir.path().join("archive.json")).unwrap();
+        std::fs::create_dir(dir.path().join("archive.json")).unwrap();
+
+        assert!(
+            service
+                .clear_history_with_active(Some(dir.path().join("outside.jpg")))
+                .is_err()
+        );
+
+        assert_eq!(service.archive.records.len(), 1);
+        assert!(dir.path().join("one.jpg").is_file());
     }
 }

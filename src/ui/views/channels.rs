@@ -18,7 +18,7 @@ const CARD: f32 = 146.0;
 const CARD_GAP: f32 = 10.0;
 
 pub fn view(state: &State, p: Paint, cx: &mut rune::Cx<State>) -> El {
-    let id = state.archive.preferences.channel.clone();
+    let id = state.selected_channel().to_owned();
     let active = catalog::channel(&id).ok();
     let header = page_header(
         p,
@@ -29,18 +29,11 @@ pub fn view(state: &State, p: Paint, cx: &mut rune::Cx<State>) -> El {
             "Nineteen instruments over one archive. Pick a wavelength, inspect the newest capture, then put the Sun on your desktop.",
             "Diecinueve instrumentos sobre un archivo. Elegí una longitud de onda, revisá la última captura y poné el Sol en tu escritorio.",
         ),
-        vec![
-            ghost_button(
-                tr(state, "Check now", "Buscar ahora"),
-                &icons::SYNC,
-                |s: &mut State| s.acquire(true, false),
-            ),
-            accent_button(
-                tr(state, "Apply", "Aplicar"),
-                &icons::APPLY,
-                |s: &mut State| s.acquire(false, true),
-            ),
-        ],
+        vec![ghost_button(
+            tr(state, "Check now", "Buscar ahora"),
+            &icons::SYNC,
+            |s: &mut State| s.acquire(true, false),
+        )],
     );
     col()
         .key("channels-page")
@@ -73,7 +66,7 @@ pub fn view(state: &State, p: Paint, cx: &mut rune::Cx<State>) -> El {
 fn hero(state: &State, p: Paint, active: Option<&'static Channel>) -> El {
     let t = p.t;
     let id = active.map(|c| c.id.as_str()).unwrap_or("0304");
-    let preview = channel_preview(state, id);
+    let preview = channel_capture_preview(state, id);
     let has_capture = state
         .archive
         .latest(id)
@@ -166,6 +159,13 @@ fn hero(state: &State, p: Paint, active: Option<&'static Channel>) -> El {
                     },
                     t.teal,
                 )),
+        )
+        // A restrained liquid-metal bezel frames the selected instrument's focal solar image.
+        .child(
+            el().key("hero-metal-bezel")
+                .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+                .radius(18.0)
+                .effect(super::super::effects::METAL),
         );
 
     let simple = active
@@ -243,15 +243,44 @@ fn hero(state: &State, p: Paint, active: Option<&'static Channel>) -> El {
                         .w_full()
                         .gap(8.0)
                         .child(accent_button(
-                            tr(state, "Set wallpaper", "Poner de fondo"),
+                            match state.apply_feedback {
+                                Some(crate::ui::ApplyFeedback::Applying) => {
+                                    tr(state, "Applying…", "Aplicando…")
+                                }
+                                Some(crate::ui::ApplyFeedback::Applied) => {
+                                    tr(state, "Applied", "Aplicado")
+                                }
+                                None => tr(state, "Set wallpaper", "Poner de fondo"),
+                            },
                             &icons::APPLY,
-                            |s: &mut State| s.acquire(false, true),
+                            |s: &mut State| s.apply_selected(),
                         ))
                         .child(ghost_button(
                             tr(state, "Crop", "Recortar"),
                             &icons::CROP,
                             |s: &mut State| s.edit_crop(),
-                        )),
+                        ))
+                        .child(match state.apply_feedback {
+                            Some(crate::ui::ApplyFeedback::Applying) => row()
+                                .key("wallpaper-applying")
+                                .gap(6.0)
+                                .center_y()
+                                .child(components::pulse_dot(t.teal, 0.8, true))
+                                .child(components::micro(
+                                    tr(state, "Applying wallpaper…", "Aplicando el fondo…"),
+                                    t.teal,
+                                )),
+                            Some(crate::ui::ApplyFeedback::Applied) => row()
+                                .key("wallpaper-applied")
+                                .gap(6.0)
+                                .center_y()
+                                .child(components::status_dot(t.teal, false))
+                                .child(components::micro(
+                                    tr(state, "Wallpaper applied", "Fondo aplicado"),
+                                    t.teal,
+                                )),
+                            None => el(),
+                        }),
                 ),
         )
 }
@@ -338,7 +367,7 @@ fn columns_for(width: Option<f32>) -> (usize, f32) {
     (columns, ((width - gaps) / columns as f32).floor())
 }
 
-fn channel_preview<'a>(state: &'a State, id: &str) -> Option<&'a rune::Pixels> {
+fn channel_capture_preview<'a>(state: &'a State, id: &str) -> Option<&'a rune::Pixels> {
     state
         .archive
         .latest(id)
@@ -347,10 +376,14 @@ fn channel_preview<'a>(state: &'a State, id: &str) -> Option<&'a rune::Pixels> {
         .or_else(|| state.reference_previews.get(id))
 }
 
+fn channel_thumbnail<'a>(state: &'a State, id: &str) -> Option<&'a rune::Pixels> {
+    state.reference_previews.get(id)
+}
+
 fn card(state: &State, p: Paint, channel: &'static Channel, width: f32) -> El {
     let t = p.t;
-    let selected = state.archive.preferences.channel == channel.id;
-    let preview = channel_preview(state, &channel.id);
+    let selected = state.selected_channel() == channel.id;
+    let preview = channel_thumbnail(state, &channel.id);
     let id = channel.id.clone();
     // The padding is 8 a side, so a square of the inner width keeps the whole Sun in the tile
     // instead of cropping a band out of it.
@@ -409,7 +442,7 @@ mod tests {
     use rune::{Env, Runtime};
 
     #[test]
-    fn channel_preview_uses_latest_archived_capture() {
+    fn channel_capture_preview_uses_latest_archived_capture() {
         let mut state = State::default();
         let record = |id: &str, time| solar_rust::domain::Record {
             id: id.into(),
@@ -425,15 +458,81 @@ mod tests {
         state.archive.records = vec![record("old", 1), record("new", 2)];
         state.previews.insert("old".into(), rune::Pixels::new());
         assert!(std::ptr::eq(
-            channel_preview(&state, "0304").unwrap(),
+            channel_capture_preview(&state, "0304").unwrap(),
             &state.reference_previews["0304"]
         ));
         state.previews.insert("new".into(), rune::Pixels::new());
         assert!(std::ptr::eq(
-            channel_preview(&state, "0304").unwrap(),
+            channel_capture_preview(&state, "0304").unwrap(),
             &state.previews["new"]
         ));
-        assert!(channel_preview(&state, "missing").is_none());
+        assert!(channel_capture_preview(&state, "missing").is_none());
+    }
+
+    #[test]
+    fn channel_thumbnails_always_use_the_catalog_reference() {
+        let mut state = State::default();
+        let record = solar_rust::domain::Record {
+            id: "latest-capture".into(),
+            channel: "0304".into(),
+            url: String::new(),
+            remote_modified: None,
+            downloaded_at: 1,
+            bytes: 0,
+            file: String::new(),
+            width: 1,
+            height: 1,
+        };
+        state.archive.records.push(record);
+        state
+            .previews
+            .insert("latest-capture".into(), rune::Pixels::new());
+
+        assert!(std::ptr::eq(
+            channel_thumbnail(&state, "0304").unwrap(),
+            &state.reference_previews["0304"]
+        ));
+        assert!(channel_thumbnail(&state, "missing").is_none());
+    }
+
+    #[test]
+    fn hero_has_the_single_channel_apply_action() {
+        let (commands, receive) = std::sync::mpsc::channel();
+        let mut state = State {
+            commands: Some(commands),
+            ..State::default()
+        };
+        state.archive.records.push(solar_rust::domain::Record {
+            id: "capture-1".into(),
+            channel: "0304".into(),
+            url: String::new(),
+            remote_modified: None,
+            downloaded_at: 1,
+            bytes: 1,
+            file: "capture.jpg".into(),
+            width: 1,
+            height: 1,
+        });
+        let mut runtime = Runtime::new(
+            state,
+            crate::ui::views::view,
+            (1180.0, 820.0),
+            Env::new(true, 1.0),
+        );
+        runtime.frame(0.0);
+        assert!(runtime.find("accent-Aplicar").is_none());
+        let (x, y) = runtime
+            .find("accent-Poner de fondo")
+            .expect("hero apply button");
+        runtime.pointer_move(x, y);
+        runtime.pointer_down(x, y);
+        runtime.pointer_up(x, y);
+        runtime.frame(0.0);
+
+        assert!(matches!(
+            receive.try_recv(),
+            Ok(crate::ui::worker::Command::Apply { id, .. }) if id == "capture-1"
+        ));
     }
 
     #[test]
